@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 from copy import deepcopy
+from io import BytesIO
 from pathlib import Path
 
 from docx import Document
@@ -12,6 +13,7 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml.ns import qn
 from docx.shared import Inches, Pt
 from docx.text.run import Run
+from PIL import Image, ImageDraw, ImageFont
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -20,6 +22,7 @@ EXPECTED_TEMPLATE_SHA256 = (
     "6e3d9d4923e5575030045f1a894cf65d3062276082e5c59c29a49ce510f42518"
 )
 SCREENSHOTS = ROOT / "report" / "screenshots"
+NAME_FONT_PATH = Path("/System/Library/Fonts/Supplemental/Arial Unicode.ttf")
 
 ANSWER_PARAGRAPHS = (14, 18, 22, 26, 30)
 CHECKLIST_PARAGRAPHS = (33, 34, 35, 36, 37)
@@ -59,6 +62,38 @@ def fill_answer_cell(cell, text: str, *, size: float = 10.5) -> None:
     run = paragraph.add_run(text)
     run.font.name = "Calibri"
     run.font.size = Pt(size)
+
+
+def fill_name_cell(cell, text: str) -> None:
+    """Render the Chinese name visibly while retaining its searchable text."""
+
+    if not NAME_FONT_PATH.exists():
+        raise FileNotFoundError(NAME_FONT_PATH)
+
+    font = ImageFont.truetype(str(NAME_FONT_PATH), 48)
+    left, top, right, bottom = font.getbbox(text)
+    padding = 6
+    image = Image.new(
+        "RGBA",
+        (right - left + 2 * padding, bottom - top + 2 * padding),
+        (255, 255, 255, 0),
+    )
+    draw = ImageDraw.Draw(image)
+    draw.text((padding - left, padding - top), text, font=font, fill=(0, 0, 0, 255))
+
+    stream = BytesIO()
+    image.save(stream, format="PNG", dpi=(300, 300))
+    stream.seek(0)
+
+    paragraph = cell.paragraphs[0]
+    paragraph.clear()
+    picture = paragraph.add_run().add_picture(stream, height=Inches(0.18))
+    picture._inline.docPr.set("descr", text)
+    picture._inline.docPr.set("title", text)
+
+    searchable = paragraph.add_run(text)
+    searchable.font.hidden = True
+    searchable.font.size = Pt(1)
 
 
 def tick_first_checkbox(paragraph) -> None:
@@ -117,7 +152,9 @@ def tick_styled_checkboxes(
         raise RuntimeError("A requested checkbox position does not exist.")
 
 
-def insert_screenshot(cell, path: Path, width: float, expected: str) -> None:
+def insert_screenshot(
+    cell, path: Path, width: float, expected: str, alt_text: str
+) -> None:
     """Replace one screenshot placeholder cell with its tested evidence image."""
 
     if not path.exists():
@@ -129,7 +166,9 @@ def insert_screenshot(cell, path: Path, width: float, expected: str) -> None:
     paragraph = cell.paragraphs[0]
     paragraph.clear()
     paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    paragraph.add_run().add_picture(str(path), width=Inches(width))
+    picture = paragraph.add_run().add_picture(str(path), width=Inches(width))
+    picture._inline.docPr.set("descr", alt_text)
+    picture._inline.docPr.set("title", alt_text)
 
 
 def _without_checkbox(text: str) -> str:
@@ -180,6 +219,8 @@ def verify_template_text(
         7: args.github_url,
         8: args.demo_video,
     }.items():
+        if provided.strip() and result_basic.cell(row, 1).text != provided:
+            raise RuntimeError(f"Basic Information row {row} has the wrong answer.")
         if not provided.strip() and result_basic.cell(row, 1).text != source_basic.cell(row, 1).text:
             raise RuntimeError(f"Unanswered Basic Information row {row} changed.")
     if _normalize_checkboxes(result_basic.cell(4, 1).text) != _normalize_checkboxes(
@@ -263,7 +304,10 @@ def main() -> None:
     if args.demo_video.strip():
         basic_values[8] = args.demo_video
     for row, value in basic_values.items():
-        fill_answer_cell(basic.cell(row, 1), value)
+        if row == 2:
+            fill_name_cell(basic.cell(row, 1), value)
+        else:
+            fill_answer_cell(basic.cell(row, 1), value)
     tick_styled_checkboxes(
         basic.cell(4, 1).paragraphs[0],
         checked_positions={0, 1},
@@ -345,6 +389,7 @@ def main() -> None:
         SCREENSHOTS / "conversation_1_rag_report.png",
         5.9,
         "(Paste your screenshot here: Conversation 1)",
+        "Conversation 1: food-rule RAG answer with its cited rule section.",
     )
 
     replace_placeholder_paragraph(
@@ -363,6 +408,7 @@ def main() -> None:
         SCREENSHOTS / "conversation_2_booking_report.png",
         5.2,
         "(Paste your screenshot here: Conversation 2)",
+        "Conversation 2: room search and confirmed booking BK0001.",
     )
 
     fill_blank_paragraph(
@@ -376,6 +422,7 @@ def main() -> None:
         SCREENSHOTS / "conversation_3_missing_report.png",
         5.9,
         "(Paste your screenshot here: Conversation 3)",
+        "Conversation 3: honest not-found response for booking B9999.",
     )
 
     fill_blank_paragraph(
@@ -389,6 +436,7 @@ def main() -> None:
         SCREENSHOTS / "saved_data_evidence_report.png",
         4.85,
         "(Paste your screenshot here: the saved data)",
+        "Saved-data evidence: lookup confirms stored booking BK0001.",
     )
 
     ai_table = tables[7]
