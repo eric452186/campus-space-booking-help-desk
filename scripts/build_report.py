@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+from copy import deepcopy
 from pathlib import Path
 
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.oxml.ns import qn
 from docx.shared import Inches, Pt
+from docx.text.run import Run
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -18,17 +21,13 @@ EXPECTED_TEMPLATE_SHA256 = (
 )
 SCREENSHOTS = ROOT / "report" / "screenshots"
 
-HINT_PARAGRAPHS = (1, 5, 8, 11, 13, 17, 21, 25, 29, 32)
-FIXED_PARAGRAPHS = (0, 2, 3, 4, 6, 7, 9, 10, 15, 19, 20, 23, 24, 27, 28, 31)
 ANSWER_PARAGRAPHS = (14, 18, 22, 26, 30)
 CHECKLIST_PARAGRAPHS = (33, 34, 35, 36, 37)
-CHECKED_CHECKLIST_PARAGRAPHS = (34, 36, 37)
-
-
-def clear_hint(paragraph) -> None:
-    """Remove a template hint without inserting replacement prose."""
-
-    paragraph.clear()
+CHECKED_CHECKLIST_PARAGRAPHS = (34, 35, 36, 37)
+EDITABLE_PARAGRAPHS = (12, 16) + ANSWER_PARAGRAPHS + CHECKLIST_PARAGRAPHS
+FIXED_PARAGRAPHS = tuple(
+    index for index in range(38) if index not in set(EDITABLE_PARAGRAPHS)
+)
 
 
 def fill_blank_paragraph(paragraph, text: str) -> None:
@@ -74,6 +73,50 @@ def tick_first_checkbox(paragraph) -> None:
     raise RuntimeError("The checkbox was not found in a text run.")
 
 
+def tick_styled_checkboxes(
+    paragraph, *, checked_positions: set[int], expected_count: int
+) -> None:
+    """Tick selected boxes while preserving every surrounding styled text segment."""
+
+    box_index = 0
+    for original_run in list(paragraph.runs):
+        if "☐" not in original_run.text:
+            continue
+
+        pieces = original_run.text.split("☐")
+        for piece_index, piece in enumerate(pieces):
+            if piece:
+                text_element = deepcopy(original_run._r)
+                text_run = Run(text_element, paragraph)
+                text_run.text = piece
+                original_run._r.addprevious(text_element)
+
+            if piece_index == len(pieces) - 1:
+                continue
+
+            box_element = deepcopy(original_run._r)
+            box_run = Run(box_element, paragraph)
+            if box_index in checked_positions:
+                box_run.text = "☑"
+                box_run.font.name = "Calibri"
+                box_run.font.italic = False
+                box_run._element.rPr.rFonts.set(qn("w:ascii"), "Calibri")
+                box_run._element.rPr.rFonts.set(qn("w:hAnsi"), "Calibri")
+            else:
+                box_run.text = "☐"
+            original_run._r.addprevious(box_element)
+            box_index += 1
+
+        original_run._r.getparent().remove(original_run._r)
+
+    if box_index != expected_count:
+        raise RuntimeError(
+            f"Expected {expected_count} unchecked boxes, found {box_index}: {paragraph.text!r}"
+        )
+    if not checked_positions.issubset(set(range(box_index))):
+        raise RuntimeError("A requested checkbox position does not exist.")
+
+
 def insert_screenshot(cell, path: Path, width: float, expected: str) -> None:
     """Replace one screenshot placeholder cell with its tested evidence image."""
 
@@ -95,10 +138,16 @@ def _without_checkbox(text: str) -> str:
     return text[1:]
 
 
-def verify_template_text(output_path: Path) -> None:
+def _normalize_checkboxes(text: str) -> str:
+    return text.replace("☑", "☐")
+
+
+def verify_template_text(
+    template_path: Path, output_path: Path, args: argparse.Namespace
+) -> None:
     """Fail if any fixed template wording changed outside approved answer slots."""
 
-    reference = Document(TEMPLATE)
+    reference = Document(template_path)
     result = Document(output_path)
 
     if len(reference.paragraphs) != len(result.paragraphs):
@@ -109,9 +158,6 @@ def verify_template_text(output_path: Path) -> None:
     for index in FIXED_PARAGRAPHS:
         if result.paragraphs[index].text != reference.paragraphs[index].text:
             raise RuntimeError(f"Fixed template paragraph P{index} changed.")
-    for index in HINT_PARAGRAPHS:
-        if result.paragraphs[index].text:
-            raise RuntimeError(f"Template hint P{index} was rewritten instead of cleared.")
     for index in ANSWER_PARAGRAPHS:
         if not result.paragraphs[index].text.strip():
             raise RuntimeError(f"Answer paragraph P{index} is empty.")
@@ -125,6 +171,23 @@ def verify_template_text(output_path: Path) -> None:
         for row in range(1, len(source_table.rows)):
             if result_table.cell(row, 0).text != source_table.cell(row, 0).text:
                 raise RuntimeError(f"Table {table_index} question row {row} changed.")
+
+    source_basic = reference.tables[0]
+    result_basic = result.tables[0]
+    for row, provided in {
+        1: args.student_id,
+        2: args.student_name,
+        7: args.github_url,
+        8: args.demo_video,
+    }.items():
+        if not provided.strip() and result_basic.cell(row, 1).text != source_basic.cell(row, 1).text:
+            raise RuntimeError(f"Unanswered Basic Information row {row} changed.")
+    if _normalize_checkboxes(result_basic.cell(4, 1).text) != _normalize_checkboxes(
+        source_basic.cell(4, 1).text
+    ):
+        raise RuntimeError("Technique option wording changed beyond its checkboxes.")
+    if result_basic.cell(4, 1).text.count("☑") != 2:
+        raise RuntimeError("Both technique checkboxes must be checked.")
 
     source_parts = reference.tables[2]
     result_parts = result.tables[2]
@@ -141,8 +204,12 @@ def verify_template_text(output_path: Path) -> None:
 
     ai_location_source = reference.tables[7].cell(2, 1).text
     ai_location_result = result.tables[7].cell(2, 1).text
-    if _without_checkbox(ai_location_result) != _without_checkbox(ai_location_source):
+    if _normalize_checkboxes(ai_location_result) != _normalize_checkboxes(ai_location_source):
         raise RuntimeError("AI-tool location option wording changed.")
+    if not ai_location_result.startswith("☑") or ai_location_result.count("☑") != 1:
+        raise RuntimeError("Only the console AI-tool location may be checked.")
+    if not args.hours.strip() and reference.tables[7].cell(3, 1).text != result.tables[7].cell(3, 1).text:
+        raise RuntimeError("The unanswered AI-hours hint changed.")
 
     for index in CHECKLIST_PARAGRAPHS:
         source = reference.paragraphs[index].text
@@ -156,9 +223,11 @@ def verify_template_text(output_path: Path) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--template", type=Path, default=TEMPLATE)
     parser.add_argument("--student-id", default="")
     parser.add_argument("--student-name", default="")
     parser.add_argument("--github-url", default="")
+    parser.add_argument("--demo-video", default="")
     parser.add_argument("--hours", default="")
     parser.add_argument(
         "--output",
@@ -170,29 +239,36 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    actual_hash = hashlib.sha256(TEMPLATE.read_bytes()).hexdigest()
+    template_path = args.template.resolve()
+    actual_hash = hashlib.sha256(template_path.read_bytes()).hexdigest()
     if actual_hash != EXPECTED_TEMPLATE_SHA256:
         raise RuntimeError("The retained report template changed; distill it again first.")
 
-    document = Document(TEMPLATE)
+    document = Document(template_path)
     paragraphs = document.paragraphs
     tables = document.tables
 
-    for index in HINT_PARAGRAPHS:
-        clear_hint(paragraphs[index])
-
     basic = tables[0]
-    for row, value in {
-        1: args.student_id,
-        2: args.student_name,
+    basic_values = {
         3: "Campus Space Booking Help Desk",
-        4: "☑ Tool calling   ☑ RAG",
         5: "gpt-4.1-mini; text-embedding-3-small for RAG",
         6: "Gradio",
-        7: args.github_url,
-        8: "",
-    }.items():
+    }
+    if args.student_id.strip():
+        basic_values[1] = args.student_id
+    if args.student_name.strip():
+        basic_values[2] = args.student_name
+    if args.github_url.strip():
+        basic_values[7] = args.github_url
+    if args.demo_video.strip():
+        basic_values[8] = args.demo_video
+    for row, value in basic_values.items():
         fill_answer_cell(basic.cell(row, 1), value)
+    tick_styled_checkboxes(
+        basic.cell(4, 1).paragraphs[0],
+        checked_positions={0, 1},
+        expected_count=2,
+    )
 
     topic = tables[1]
     topic_values = {
@@ -252,9 +328,6 @@ def main() -> None:
     for row, explanation in part_values.items():
         tick_first_checkbox(parts.cell(row, 0).paragraphs[0])
         fill_answer_cell(parts.cell(row, 1), explanation, size=9.8)
-
-    for index in (10, 16, 20, 24, 27):
-        paragraphs[index].paragraph_format.page_break_before = True
 
     replace_placeholder_paragraph(
         paragraphs[12],
@@ -320,18 +393,13 @@ def main() -> None:
 
     ai_table = tables[7]
     fill_answer_cell(ai_table.cell(1, 1), "Codex")
-    fill_answer_cell(
-        ai_table.cell(2, 1),
-        "☑ In a console (a command-line tool)\n"
-        "☐ Inside VS Code\n"
-        "☐ In a web chat page\n"
-        "☐ Other tools: ____",
-        size=10.0,
+    tick_styled_checkboxes(
+        ai_table.cell(2, 1).paragraphs[0],
+        checked_positions={0},
+        expected_count=4,
     )
-    fill_answer_cell(
-        ai_table.cell(3, 1),
-        f"about {args.hours} hours" if args.hours.strip() else "",
-    )
+    if args.hours.strip():
+        fill_answer_cell(ai_table.cell(3, 1), f"about {args.hours} hours")
     fill_answer_cell(
         ai_table.cell(4, 1),
         "Planning, code generation and review, synthetic data, system prompt, "
@@ -354,9 +422,9 @@ def main() -> None:
     output_path = args.output.resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     document.save(output_path)
-    verify_template_text(output_path)
+    verify_template_text(template_path, output_path, args)
 
-    if hashlib.sha256(TEMPLATE.read_bytes()).hexdigest() != actual_hash:
+    if hashlib.sha256(template_path.read_bytes()).hexdigest() != actual_hash:
         raise RuntimeError("The retained report template was modified during authoring.")
     print(output_path)
 
